@@ -1,0 +1,56 @@
+{
+  "name": "sql-zero-doctrine",
+  "displayName": "SQL Formatter — Zero Doctrine",
+  "description": "Formats SQL stored procedures and queries using the Zero Doctrine ruleset — powered by Claude AI.",
+  "version": "1.0.0",
+  "publisher": "Harsh",
+  "author": {
+    "name": "Harsh"
+  },
+  "icon": "icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.110.0"
+  },
+  "categories": ["Formatters"],
+  "keywords": ["sql", "formatter", "zero doctrine", "stored procedure", "claude", "ai"],
+  "activationEvents": [
+    "onLanguage:sql",
+    "onLanguage:SQL",
+    "onLanguage:tsql",
+    "onLanguage:mssql",
+    "onLanguage:sql-ms"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sqlZeroDoctrine.formatFile",
+        "title": "Format Document",
+        "category": "SQL Zero Doctrine"
+      },
+      {
+        "command": "sqlZeroDoctrine.formatSelection",
+        "title": "Format Selection",
+        "category": "SQL Zero Doctrine"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "sqlZeroDoctrine.formatFile",
+          "when": "resourceExtension == sql || resourceExtension == SQL",
+          "group": "1_modification"
+        },
+        {
+          "command": "sqlZeroDoctrine.formatSelection",
+          "when": "(resourceExtension == sql || resourceExtension == SQL) && editorHasSelection",
+          "group": "1_modification"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
