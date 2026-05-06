@@ -1,7 +1,7 @@
 {
   "name": "sql-zero-doctrine",
   "displayName": "SQL Formatter — Zero Doctrine",
-  "description": "Formats SQL stored procedures and queries using the Zero Doctrine ruleset — powered by Claude AI.",
+  "description": "Formats SQL stored procedures and queries using the Zero Doctrine ruleset",
   "version": "1.0.0",
   "publisher": "Harsh",
   "author": {
@@ -13,7 +13,7 @@
     "vscode": "^1.110.0"
   },
   "categories": ["Formatters"],
-  "keywords": ["sql", "formatter", "zero doctrine", "stored procedure", "claude", "ai"],
+  "keywords": ["sql", "formatter", "zero doctrine", "stored procedure"],
   "activationEvents": [
     "onLanguage:sql",
     "onLanguage:SQL",
