@@ -1,5 +1,5 @@
 {
-  "name": "sql-zero-doctrine",
+  "name": "sql-formatter",
   "displayName": "SQL Formatter — Zero Doctrine",
   "description": "Formats SQL stored procedures and queries using the Zero Doctrine ruleset",
   "version": "1.0.0",

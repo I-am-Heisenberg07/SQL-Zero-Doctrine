@@ -1,6 +1,6 @@
 SQL Formatter — Zero Doctrine
 
-Formats SQL stored procedures and queries using a strict, opinionated ruleset — powered by Claude AI.
+Formats SQL stored procedures and queries using a strict, opinionated ruleset
 
 Requirements
 
