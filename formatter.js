@@ -214,11 +214,19 @@ function splitAtCommas(tokens) {
 	const groups = [];
 	let cur = [];
 	let depth = 0;
+	let justSplit = false; // true immediately after a depth-0 COMMA
 	for (const tok of tokens) {
-		if (tok.t === 'LP') { depth++; cur.push(tok); }
-		else if (tok.t === 'RP') { depth--; cur.push(tok); }
-		else if (tok.t === 'COMMA' && depth === 0) { groups.push(cur); cur = []; }
-		else { cur.push(tok); }
+		if (tok.t === 'NL') continue; // strip newlines — they cause comment bleeding
+		if (tok.t === 'LP') { depth++; cur.push(tok); justSplit = false; }
+		else if (tok.t === 'RP') { depth--; cur.push(tok); justSplit = false; }
+		else if (tok.t === 'COMMA' && depth === 0) {
+			groups.push(cur); cur = []; justSplit = true;
+		} else if (tok.t === 'COMMENT' && justSplit && groups.length) {
+			// Trailing comment after a comma — belongs to the PREVIOUS group
+			groups[groups.length - 1].push(tok);
+		} else {
+			cur.push(tok); justSplit = false;
+		}
 	}
 	if (cur.length) groups.push(cur);
 	return groups;
@@ -398,7 +406,9 @@ function formatSelectClause(clauseTokens, noColumnNumbers) {
 }
 
 function parseSelectColumn(tokens, idx) {
+	// Strip NL and trailing source comments (--00, --06 etc) — formatter adds its own
 	tokens = tokens.filter(t => t.t !== 'NL');
+	while (tokens.length && tokens[tokens.length - 1].t === 'COMMENT') tokens = tokens.slice(0, -1);
 
 	if (tokens[0]?.t === 'KW' && tokens[0]?.v === 'CASE') return formatCaseColumn(tokens, idx, false);
 	if (tokens[0]?.t === 'LP' && tokens[1]?.t === 'KW' && tokens[1]?.v === 'CASE') return formatCaseColumn(tokens, idx, true);
@@ -1069,22 +1079,24 @@ function formatProcStatement(tokens) {
 function parseProcParam(tokens, startIdx) {
 	let i = startIdx;
 	const name = tokens[i++]?.v || '';
-
+ 
 	let datatype = '';
 	if (tokens[i]?.t === 'DT' || tokens[i]?.t === 'BID' ||
 		(tokens[i]?.t === 'KW' && DATATYPES.has(tokens[i]?.v))) {
-		datatype = tokens[i++].v;
+		const raw = tokens[i++].v;
+		// Strip [ ] brackets if present and uppercase — e.g. [nvarchar] → NVARCHAR
+		datatype = raw.startsWith('[') ? raw.slice(1, -1).toUpperCase() : raw.toUpperCase();
 		if (tokens[i]?.t === 'LP') {
 			datatype += ' ('; i++;
 			while (i < tokens.length && tokens[i]?.t !== 'RP') datatype += tokens[i++].v;
 			datatype += ')'; i++;
 		}
 	}
-
+ 
 	if (tokens[i]?.t === 'KW' && tokens[i]?.v === 'READONLY') { datatype += ' READONLY'; i++; }
-
+ 
 	let defaultVal = null, isOutput = false;
-
+ 
 	if (tokens[i]?.t === 'OP' && tokens[i]?.v === '=') {
 		i++;
 		const defToks = [];
@@ -1097,9 +1109,9 @@ function parseProcParam(tokens, startIdx) {
 		}
 		defaultVal = tokStr(defToks);
 	}
-
+ 
 	if (tokens[i]?.t === 'KW' && tokens[i]?.v === 'OUTPUT') { isOutput = true; i++; }
-
+ 
 	return { name, datatype, defaultVal, isOutput, trailingComment: null, nextIdx: i };
 }
 

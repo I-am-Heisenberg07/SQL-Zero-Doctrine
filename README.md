@@ -2,11 +2,6 @@ SQL Formatter — Zero Doctrine
 
 Formats SQL stored procedures and queries using a strict, opinionated ruleset
 
-Requirements
-
-An ANTHROPIC_API_KEY environment variable must be set on your machine.
-Get your key at console.anthropic.com
-
 Usage
 
 Open any .sql file in VS Code
