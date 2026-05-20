@@ -416,7 +416,8 @@ function formatSelectClause(clauseTokens, noColumnNumbers) {
 		if (col.isMultiLine) {
 			const adjusted = [...col.lines];
 			if (idx === 0) {
-				adjusted[0] = adjusted[0].replace(/^\t\t, \(/, INDENT + INDENT + '  (');
+				// Replace leading '\t\t, ' with the SELECT prefix so SELECT keyword is preserved
+				adjusted[0] = adjusted[0].replace(/^\t\t, /, firstPrefix);
 			}
 			adjusted[adjusted.length - 1] = adjusted[adjusted.length - 1] + comment;
 			lines.push(...adjusted);
@@ -432,6 +433,61 @@ function formatSelectClause(clauseTokens, noColumnNumbers) {
 	return lines.join('\n');
 }
 
+function hasEmbeddedSubquery(tokens) {
+	for (let i = 0; i < tokens.length - 1; i++) {
+		if (tokens[i].t === 'LP' && tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'SELECT') return true;
+	}
+	return false;
+}
+
+function formatColumnWithEmbeddedSubquery(tokens, idx) {
+	tokens = tokens.filter(t => t.t !== 'NL');
+	const { expr, alias } = extractAlias(tokens);
+	const aliasStr = alias ? ' ' + bracketAlias(alias) : '';
+
+	// Find first (SELECT ...) inside the expression
+	let sqStart = -1;
+	for (let j = 0; j < expr.length - 1; j++) {
+		if (expr[j].t === 'LP' && expr[j + 1]?.t === 'KW' && expr[j + 1]?.v === 'SELECT') { sqStart = j; break; }
+	}
+	if (sqStart < 0) {
+		const mainLine = tokStr(expr) + aliasStr;
+		return { isMultiLine: false, isLong: true, mainLine };
+	}
+
+	const sqEnd      = findMatchingParen(expr, sqStart);
+	const beforeToks = expr.slice(0, sqStart);
+	const subToks    = expr.slice(sqStart + 1, sqEnd);
+	const afterToks  = expr.slice(sqEnd + 1);
+
+	const sqFmt = formatSelectStatement(subToks, true);
+	const ind2 = INDENT + INDENT;
+	const ind3 = INDENT + INDENT + INDENT;
+	const ind4 = INDENT + INDENT + INDENT + INDENT;
+
+	const lines = [];
+	const lastBefore = beforeToks[beforeToks.length - 1];
+	if (lastBefore?.t === 'LP') {
+		// Function call: beforeToks ends with the function's opening LP
+		lines.push(ind2 + ', ' + tokStr(beforeToks.slice(0, -1)) + ' (');
+	} else {
+		// Args before subquery (e.g. FUNC(arg1, )
+		lines.push(ind2 + ', ' + tokStr(beforeToks));
+	}
+	lines.push(ind3 + '(');
+	sqFmt.split('\n').forEach(l => lines.push(ind4 + l));
+
+	// After-subquery tokens: may end with RP that closes the outer function call
+	const hasClosingRP = afterToks.length > 0 && afterToks[afterToks.length - 1]?.t === 'RP';
+	const middleToks   = hasClosingRP ? afterToks.slice(0, -1) : afterToks;
+	const middleStr    = middleToks.length ? tokStr(middleToks) : '';
+
+	lines.push(ind3 + ')' + middleStr);
+	lines.push(ind2 + (hasClosingRP ? ')' : '') + aliasStr);
+
+	return { isMultiLine: true, isLong: false, lines };
+}
+
 function parseSelectColumn(tokens, idx) {
 	// Strip NL and trailing source comments (--00, --06 etc) â€” formatter adds its own
 	tokens = tokens.filter(t => t.t !== 'NL');
@@ -443,6 +499,9 @@ function parseSelectColumn(tokens, idx) {
 
 	const hasOver = tokens.some(t => t.t === 'KW' && t.v === 'OVER');
 	const { expr, alias } = extractAlias(tokens);
+
+	if (hasEmbeddedSubquery(expr)) return formatColumnWithEmbeddedSubquery(tokens, idx);
+
 	const exprStr = tokStr(expr);
 	const aliasStr = alias ? bracketAlias(alias) : null;
 	const mainLine = aliasStr ? exprStr + ' ' + aliasStr : exprStr;
@@ -560,6 +619,63 @@ function formatSubqueryColumn(tokens, idx) {
 
 const JOIN_START_KWS = new Set(['JOIN','INNER','LEFT','RIGHT','FULL','CROSS','OUTER','APPLY']);
 
+const CMP_OPS = new Set(['=', '<>', '!=', '>', '>=', '<', '<=']);
+
+function flipCmpOp(op) {
+	switch (op) {
+		case '>':  return '<';
+		case '<':  return '>';
+		case '>=': return '<=';
+		case '<=': return '>=';
+		default:   return op;
+	}
+}
+
+function bareId(s) { return s.replace(/^\[|\]$/g, '').toLowerCase(); }
+
+function getJoinTableName(tableToks) {
+	tableToks = tableToks.filter(t => t.t !== 'NL');
+	const withIdx = tableToks.findIndex(t => t.t === 'KW' && t.v === 'WITH');
+	const mainToks = withIdx >= 0 ? tableToks.slice(0, withIdx) : tableToks;
+	const { expr, alias } = extractAlias(mainToks);
+	if (alias) return bareId(alias);
+	for (let i = expr.length - 1; i >= 0; i--) {
+		if (expr[i].t === 'ID' || expr[i].t === 'BID') return bareId(expr[i].v);
+	}
+	return null;
+}
+
+function tableRefOnSide(tokens) {
+	for (let i = 0; i < tokens.length - 1; i++) {
+		if ((tokens[i].t === 'ID' || tokens[i].t === 'BID') && tokens[i + 1]?.t === 'DOT') {
+			return bareId(tokens[i].v);
+		}
+	}
+	return null;
+}
+
+function reorderOnCondition(condToks, joinedTable) {
+	let opIdx = -1, depth = 0;
+	for (let i = 0; i < condToks.length; i++) {
+		if (condToks[i].t === 'LP') { depth++; continue; }
+		if (condToks[i].t === 'RP') { depth--; continue; }
+		if (depth === 0 && condToks[i].t === 'OP' && CMP_OPS.has(condToks[i].v)) { opIdx = i; break; }
+	}
+	if (opIdx < 0) return condToks;
+
+	const leftToks  = condToks.slice(0, opIdx);
+	const op        = condToks[opIdx].v;
+	const rightToks = condToks.slice(opIdx + 1);
+
+	const leftRef  = tableRefOnSide(leftToks);
+	const rightRef = tableRefOnSide(rightToks);
+
+	if (rightRef === joinedTable && leftRef !== joinedTable) {
+		return [...rightToks, { t: 'OP', v: flipCmpOp(op) }, ...leftToks];
+	}
+	return condToks;
+}
+
 function formatFromClause(clauseTokens) {
 	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
 	const blocks = splitFromBlocks(clauseTokens);
@@ -577,12 +693,14 @@ function formatFromClause(clauseTokens) {
 		lines.push(INDENT + INDENT + block.joinType + ' ' + formatTableRef(tableToks));
 
 		if (onToks.length) {
+			const joinedTable = getJoinTableName(tableToks);
 			const conditions = splitAtTopKws(onToks, new Set(['AND', 'OR']));
 			conditions.forEach(({ kw, tokens: ct }, ci) => {
 				if (!ct.length) return;
+				const ordered = joinedTable ? reorderOnCondition(ct, joinedTable) : ct;
 				lines.push(ci === 0
-					? INDENT + INDENT + INDENT + 'ON' + INDENT + tokStr(ct)
-					: INDENT + INDENT + INDENT + kw + INDENT + tokStr(ct));
+					? INDENT + INDENT + INDENT + 'ON' + INDENT + tokStr(ordered)
+					: INDENT + INDENT + INDENT + kw + INDENT + tokStr(ordered));
 			});
 		}
 	}
@@ -660,25 +778,116 @@ function formatTableRef(tokens) {
 // RULE 6 â€” WHERE CLAUSE
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
-function formatWhereClause(clauseTokens) {
-	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
-	const segments = splitAtTopKws(clauseTokens, new Set(['AND', 'OR']));
-	const validSegs = segments.filter(s => s.tokens.length > 0);
-	const lines = [];
+function isFullParenGroup(tokens) {
+	return tokens.length > 0 && tokens[0]?.t === 'LP' && findMatchingParen(tokens, 0) === tokens.length - 1;
+}
 
-	validSegs.forEach(({ kw, tokens: gt }, i) => {
-		const condLines = formatConditionGroup(gt);
-		if (i === 0) {
-			lines.push(INDENT + 'WHERE' + INDENT + '(');
-			condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
-			lines.push(INDENT + INDENT + ')');
+// Formats inner tokens of a paren group as a multi-line block (( ... )).
+// Leading COMMENT tokens on a segment are attached to the preceding AND/OR line.
+function formatConditionBlock(innerTokens, indent) {
+	const segs = splitAtTopKws(innerTokens.filter(t => t.t !== 'NL'), new Set(['AND', 'OR']))
+		.filter(s => s.tokens.length > 0);
+	const lines = [indent + '('];
+
+	segs.forEach(({ kw, tokens: gt }, i) => {
+		if (i > 0) {
+			let kwLine = indent + INDENT + kw;
+			let j = 0;
+			while (j < gt.length && gt[j].t === 'COMMENT') { kwLine += ' ' + gt[j].v; j++; }
+			lines.push(kwLine);
+			gt = gt.slice(j);
+		}
+		if (!gt.length) return;
+
+		if (isFullParenGroup(gt)) {
+			const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+			lines.push(...formatConditionBlock(inner, indent + INDENT));
 		} else {
-			lines.push(INDENT + INDENT + kw);
-			lines.push(INDENT + INDENT + '(');
-			condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
-			lines.push(INDENT + INDENT + ')');
+			formatConditionGroup(gt).forEach(cl => lines.push(indent + INDENT + cl));
 		}
 	});
+
+	lines.push(indent + ')');
+	return lines;
+}
+
+function expandWhereSegs(validSegs) {
+	// Flatten any paren-group that contains depth-0 AND/OR inside (double-paren case)
+	const out = [];
+	for (const { kw, tokens: gt } of validSegs) {
+		if (isFullParenGroup(gt)) {
+			const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+			const innerSegs = splitAtTopKws(inner, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
+			if (innerSegs.length > 1) {
+				out.push({ kw, tokens: innerSegs[0].tokens });
+				for (let j = 1; j < innerSegs.length; j++) out.push(innerSegs[j]);
+				continue;
+			}
+		}
+		out.push({ kw, tokens: gt });
+	}
+	return out;
+}
+
+function formatWhereClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	const raw = splitAtTopKws(clauseTokens, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
+	if (!raw.length) return 'WHERE';
+	const expanded = expandWhereSegs(raw);
+	const lines = [];
+
+	// Single condition — inline, no parens (strip outer parens if present and only 1 inner cond)
+	if (expanded.length === 1) {
+		const { tokens: gt } = expanded[0];
+		let condToks = gt;
+		if (isFullParenGroup(gt)) {
+			const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+			const innerSegs = splitAtTopKws(inner, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
+			if (innerSegs.length > 1) {
+				// Single paren-group with multiple inner conditions → one block
+				lines.push('WHERE');
+				lines.push(...formatConditionBlock(inner, INDENT));
+				return lines.join('\n');
+			}
+			condToks = inner; // strip outer parens, format inline
+		}
+		const condLines = formatConditionGroup(condToks);
+		lines.push('WHERE' + INDENT + condLines[0]);
+		condLines.slice(1).forEach(cl => lines.push(INDENT + INDENT + cl));
+		return lines.join('\n');
+	}
+
+	// Multiple segments
+	const anyParen = expanded.some(({ tokens: gt }) => isFullParenGroup(gt));
+
+	if (!anyParen) {
+		// All simple conditions → one block with AND/OR inside
+		lines.push('WHERE' + INDENT + '(');
+		expanded.forEach(({ kw, tokens: gt }, i) => {
+			const condLines = formatConditionGroup(gt);
+			const leader = i === 0 ? '' : kw + ' ';
+			lines.push(INDENT + INDENT + leader + condLines[0]);
+			condLines.slice(1).forEach(cl => lines.push(INDENT + INDENT + cl));
+		});
+		lines.push(INDENT + ')');
+	} else {
+		// Block-per-condition: each paren-group gets its own block, AND/OR between blocks
+		lines.push('WHERE');
+		expanded.forEach(({ kw, tokens: gt }, i) => {
+			if (i > 0) lines.push(INDENT + kw);
+			if (isFullParenGroup(gt)) {
+				const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+				lines.push(...formatConditionBlock(inner, INDENT));
+			} else {
+				// Non-paren segment — wrap in a block for consistency
+				const condLines = formatConditionGroup(gt);
+				lines.push(INDENT + '(');
+				condLines.forEach(cl => lines.push(INDENT + INDENT + cl));
+				lines.push(INDENT + ')');
+			}
+		});
+	}
+
 	return lines.join('\n');
 }
 
@@ -776,21 +985,57 @@ function formatOrderByClause(clauseTokens) {
 
 function formatHavingClause(clauseTokens) {
 	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
-	const segments = splitAtTopKws(clauseTokens, new Set(['AND', 'OR']));
+	const raw = splitAtTopKws(clauseTokens, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
+	if (!raw.length) return 'HAVING';
+	const expanded = expandWhereSegs(raw);
 	const lines = [];
-	segments.filter(s => s.tokens.length).forEach(({ kw, tokens: gt }, i) => {
-		const condLines = formatConditionGroup(gt);
-		if (i === 0) {
-			lines.push(INDENT + 'HAVING' + INDENT + '(');
-			condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
-			lines.push(INDENT + INDENT + ')');
-		} else {
-			lines.push(INDENT + INDENT + kw);
-			lines.push(INDENT + INDENT + '(');
-			condLines.forEach(cl => lines.push(INDENT + INDENT + INDENT + cl));
-			lines.push(INDENT + INDENT + ')');
+
+	if (expanded.length === 1) {
+		const { tokens: gt } = expanded[0];
+		let condToks = gt;
+		if (isFullParenGroup(gt)) {
+			const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+			const innerSegs = splitAtTopKws(inner, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
+			if (innerSegs.length > 1) {
+				lines.push('HAVING');
+				lines.push(...formatConditionBlock(inner, INDENT));
+				return lines.join('\n');
+			}
+			condToks = inner;
 		}
-	});
+		const condLines = formatConditionGroup(condToks);
+		lines.push('HAVING' + INDENT + condLines[0]);
+		condLines.slice(1).forEach(cl => lines.push(INDENT + INDENT + cl));
+		return lines.join('\n');
+	}
+
+	const anyParen = expanded.some(({ tokens: gt }) => isFullParenGroup(gt));
+
+	if (!anyParen) {
+		lines.push('HAVING' + INDENT + '(');
+		expanded.forEach(({ kw, tokens: gt }, i) => {
+			const condLines = formatConditionGroup(gt);
+			const leader = i === 0 ? '' : kw + ' ';
+			lines.push(INDENT + INDENT + leader + condLines[0]);
+			condLines.slice(1).forEach(cl => lines.push(INDENT + INDENT + cl));
+		});
+		lines.push(INDENT + ')');
+	} else {
+		lines.push('HAVING');
+		expanded.forEach(({ kw, tokens: gt }, i) => {
+			if (i > 0) lines.push(INDENT + kw);
+			if (isFullParenGroup(gt)) {
+				const inner = gt.slice(1, -1).filter(t => t.t !== 'NL');
+				lines.push(...formatConditionBlock(inner, INDENT));
+			} else {
+				const condLines = formatConditionGroup(gt);
+				lines.push(INDENT + '(');
+				condLines.forEach(cl => lines.push(INDENT + INDENT + cl));
+				lines.push(INDENT + ')');
+			}
+		});
+	}
+
 	return lines.join('\n');
 }
 
@@ -1014,7 +1259,8 @@ function formatProcBody(tokens, indent = INDENT) {
 
 function formatInsertClause(clauseTokens) {
 	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
-	// INSERT INTO @table SELECT ...
+
+	// INSERT INTO table SELECT ... — keep as-is
 	const selectIdx = clauseTokens.findIndex(t => t.t === 'KW' && t.v === 'SELECT');
 	if (selectIdx >= 0) {
 		const intoToks = clauseTokens.slice(0, selectIdx);
@@ -1025,20 +1271,67 @@ function formatInsertClause(clauseTokens) {
 		selectFmt.split('\n').forEach(l => lines.push(l));
 		return lines;
 	}
-	// INSERT INTO @table VALUES (...)
+
+	// INSERT INTO table [(col, ...)] VALUES (...)
 	const valuesIdx = clauseTokens.findIndex(t => t.t === 'KW' && t.v === 'VALUES');
 	if (valuesIdx >= 0) {
-		const intoToks = clauseTokens.slice(0, valuesIdx);
+		const intoToks = clauseTokens.slice(0, valuesIdx).filter(t => !(t.t === 'KW' && t.v === 'INTO'));
 		const valuesToks = clauseTokens.slice(valuesIdx + 1);
 		const lines = [];
-		lines.push('INSERT INTO ' + tokStr(intoToks.filter(t => !(t.t === 'KW' && t.v === 'INTO'))));
+
+		// Split table name from optional column list
+		const colListStart = intoToks.findIndex(t => t.t === 'LP');
+		let tableStr, colToks = null;
+		if (colListStart >= 0) {
+			const tableToks = intoToks.slice(0, colListStart);
+			tableStr = tokStr(tableToks);
+			const colListEnd = findMatchingParen(intoToks, colListStart);
+			colToks = intoToks.slice(colListStart + 1, colListEnd);
+		} else {
+			tableStr = tokStr(intoToks);
+		}
+
+		// Apply dbo. prefix to plain table names (not @vars, #temps, already-qualified)
+		if (!tableStr.includes('.') && !/^[@#]/.test(tableStr)) tableStr = 'dbo.' + tableStr;
+
+		lines.push('INSERT INTO ' + tableStr);
+
+		if (colToks) {
+			const cols = splitAtCommas(colToks);
+			lines.push('(');
+			cols.forEach((ct, i) => {
+				lines.push(INDENT + (i === 0 ? '' : ', ') + tokStr(ct));
+			});
+			lines.push(')');
+		}
+
 		lines.push('VALUES');
-		const rowGroups = splitAtCommas(valuesToks);
+
+		// Collect row groups — each top-level ( ... ) is one row
+		const rowGroups = [];
+		let i = 0;
+		while (i < valuesToks.length) {
+			if (valuesToks[i].t === 'LP') {
+				const end = findMatchingParen(valuesToks, i);
+				rowGroups.push(valuesToks.slice(i + 1, end));
+				i = end + 1;
+			} else {
+				i++;
+			}
+		}
+
 		rowGroups.forEach((rowToks, ri) => {
-			lines.push((ri === 0 ? INDENT + INDENT : INDENT + INDENT + ', ') + tokStr(rowToks));
+			lines.push(ri === 0 ? '(' : ', (');
+			const vals = splitAtCommas(rowToks);
+			vals.forEach((vt, vi) => {
+				lines.push(INDENT + (vi === 0 ? '' : ', ') + tokStr(vt));
+			});
+			lines.push(')');
 		});
+
 		return lines;
 	}
+
 	return ['INSERT ' + tokStr(clauseTokens)];
 }
 
@@ -1195,6 +1488,7 @@ function parseProcParam(tokens, startIdx) {
 		while (i < tokens.length) {
 			const t = tokens[i];
 			if (t.t === 'COMMA') break;
+			if (t.t === 'RP') break;
 			if (t.t === 'KW' && ['OUTPUT','WITH','AS'].includes(t.v)) break;
 			if (t.t === 'COMMENT') break;
 			defToks.push(t); i++;
