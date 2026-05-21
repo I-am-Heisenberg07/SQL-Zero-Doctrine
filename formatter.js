@@ -18,7 +18,7 @@ const KEYWORDS = new Set([
 	'JOIN',
 	'KEY','KILL',
 	'LEFT','LIKE','LOAD',
-	'MERGE',
+	'MATCHED','MERGE','USING',
 	'NOT','NULL','NULLIF',
 	'OF','OFF','ON','OPEN','OPENQUERY','OPENROWSET','OPENXML','OPTION','OR','ORDER','OUTER','OVER',
 	'PARTITION','PERCENT','PIVOT','PLAN','PRIMARY','PRINT','PROC','PROCEDURE',
@@ -43,6 +43,16 @@ const KEYWORDS = new Set([
 	'STRING_SPLIT','OPENJSON',
 ]);
 
+const NON_FUNC_LP_KWS = new Set([
+	'IN','NOT','AND','OR','BETWEEN','LIKE','IS','CASE','WHEN','THEN','ELSE','END',
+	'SET','FROM','WHERE','ON','BY','AS','INTO','OUTPUT','OVER','PIVOT','UNPIVOT',
+	'EXISTS','ANY','ALL','SOME','HAVING','SELECT','UPDATE','DELETE','INSERT','MERGE',
+	'IF','WHILE','BEGIN','END','RETURN','WITH','USING','MATCHED',
+]);
+
+// Registry of CTE names in the current query — excluded from dbo. prefix
+const _cteNames = new Set();
+
 const DATATYPES = new Set([
 	'BIGINT','BINARY','BIT','CHAR','DATE','DATETIME','DATETIME2','DATETIMEOFFSET',
 	'DECIMAL','FLOAT','GEOGRAPHY','GEOMETRY','HIERARCHYID','IMAGE','INT','INTEGER',
@@ -61,8 +71,8 @@ const LONG_COL_KWS = new Set([
 	'ROW_NUMBER','RANK','DENSE_RANK','FIRST_VALUE','LAST_VALUE','LAG','LEAD',
 ]);
 
-const MAX_INLINE_COL_LEN = 80;
-const IN_LIST_BREAK_AT   = 4;
+let MAX_INLINE_COL_LEN = 80; // configurable via formatSQL options
+let IN_LIST_BREAK_AT   = 4;  // configurable via formatSQL options
 
 function tokenize(sql) {
 	const tokens = [];
@@ -186,7 +196,7 @@ function tokStr(tokens) {
 	for (let i = 0; i < tokens.length; i++) {
 		const cur = tokens[i];
 		const prev = tokens[i - 1];
-		if (!cur || cur.t === 'NL') continue;
+		if (!cur || cur.t === 'NL' || cur.t === 'SEMI') continue; // FIX 3: strip semicolons
 		if (i === 0) { out += cur.v; continue; }
 		if (cur.t === 'COMMENT') { out += ' ' + cur.v; continue; }
 		if (cur.t === 'DOT' || (prev && prev.t === 'DOT')) { out += cur.v; continue; }
@@ -194,6 +204,13 @@ function tokStr(tokens) {
 		if (prev && prev.t === 'LP') { out += cur.v; continue; }
 		if (cur.t === 'COMMA') { out += cur.v; continue; }
 		if (prev && prev.t === 'COMMA') { out += ' ' + cur.v; continue; }
+		// ROBUSTNESS FIX 5: No space between function name and its opening paren
+		// Only suppress for actual function keywords, not SQL control keywords (IN, AND, etc.)
+		if (cur.t === 'LP' && prev) {
+			const prevIsFunc = (prev.t === 'KW' && !NON_FUNC_LP_KWS.has(prev.v)) ||
+			                   prev.t === 'ID' || prev.t === 'DT' || prev.t === 'BID';
+			if (prevIsFunc) { out += cur.v; continue; }
+		}
 		out += ' ' + cur.v;
 	}
 	return out;
@@ -262,7 +279,11 @@ const TOP_CLAUSE_KWS = new Set([
 	'CREATE','ALTER','DROP',
 	'DECLARE','SET','IF','WHILE',
 	'RETURN','EXEC','EXECUTE','PRINT','RAISERROR','THROW',
+	'INTO',
 ]);
+
+// Keywords that are NOT clause starters when inside a MERGE body
+const MERGE_BODY_KWS = new Set(['UPDATE','INSERT','DELETE','WHEN','USING','ON','OUTPUT','SET']);
 
 function splitIntoClauses(tokens) {
 	const clauses = [];
@@ -270,6 +291,8 @@ function splitIntoClauses(tokens) {
 	let parenDepth = 0;
 	let caseDepth = 0;
 	let beginDepth = 0;
+
+	let mergeDepth = 0;
 
 	for (const tok of tokens) {
 		if (tok.t === 'NL' || tok.t === 'GO') continue;
@@ -282,11 +305,19 @@ function splitIntoClauses(tokens) {
 		if (!inBlock && tok.t === 'KW' && TOP_CLAUSE_KWS.has(tok.v)) {
 			const lastTok = cur?.tokens[cur.tokens.length - 1];
 			const isElseIf = tok.v === 'IF' && lastTok?.t === 'KW' && lastTok?.v === 'ELSE';
+			// Suppress INTO as clause-splitter inside INSERT (INSERT INTO is one unit)
+			const isInsertInto = tok.v === 'INTO' && cur?.type === 'INSERT';
 			if (isElseIf) {
 				cur.tokens.push(tok);
+			} else if (isInsertInto) {
+				cur.tokens.push(tok); // absorb INTO into INSERT clause
+			} else if (mergeDepth > 0 && MERGE_BODY_KWS.has(tok.v)) {
+				// Inside MERGE body — don't split on UPDATE/INSERT/DELETE/WHEN
+				if (cur) cur.tokens.push(tok);
 			} else {
 				if (cur) clauses.push(cur);
 				cur = { type: tok.v, tokens: [] };
+				if (tok.v === 'MERGE') mergeDepth++;
 			}
 		} else if (cur) {
 			cur.tokens.push(tok);
@@ -306,9 +337,17 @@ function splitIntoClauses(tokens) {
 function extractAlias(tokens) {
 	const asIdx = findLastIdx(tokens, t => t.t === 'KW' && t.v === 'AS');
 	if (asIdx >= 0 && asIdx === tokens.length - 2) {
-		const aliasToken = tokens[asIdx + 1];
-		const alias = (aliasToken.t === 'BID') ? aliasToken.v : `[${aliasToken.v}]`;
-		return { expr: tokens.slice(0, asIdx), alias };
+		// Missing 3: only strip AS at depth 0 — AS inside CAST(x AS TYPE) must stay
+		let depth = 0;
+		for (let i = 0; i < asIdx; i++) {
+			if (tokens[i].t === 'LP') depth++;
+			else if (tokens[i].t === 'RP') depth--;
+		}
+		if (depth === 0) {
+			const aliasToken = tokens[asIdx + 1];
+			const alias = (aliasToken.t === 'BID') ? aliasToken.v : `[${aliasToken.v}]`;
+			return { expr: tokens.slice(0, asIdx), alias };
+		}
 	}
 	const last = tokens[tokens.length - 1];
 	const prev = tokens[tokens.length - 2];
@@ -365,6 +404,13 @@ function formatSelectClause(clauseTokens, noColumnNumbers) {
 		const prefix = idx === 0 ? firstPrefix : contPrefix;
 		const comment = noColumnNumbers ? '' : ('  ' + colComment(idx));
 
+		// FIX 4: emit standalone leading comments before this column
+		if (col.leadingComments?.length) {
+			// idx=0: comment goes before SELECT line (no indent); idx>0: INDENT+INDENT
+			const cmtIndent = idx === 0 ? '' : (INDENT + INDENT);
+			col.leadingComments.forEach(c => lines.push(cmtIndent + c.v));
+		}
+
 		if (col.isMultiLine) {
 			const adjusted = [...col.lines];
 			if (idx === 0) {
@@ -391,11 +437,133 @@ function hasEmbeddedSubquery(tokens) {
 	return false;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// RULE 19 — SUBQUERY IN FUNCTION ARGS / EXPRESSIONS
+// ════════════════════════════════════════════════════════════════════════════
+
+// Check if any arg in a token list contains a subquery: ( SELECT ...
+function argHasSubquery(tokens) {
+	for (let i = 0; i < tokens.length - 1; i++) {
+		if (tokens[i].t === 'LP' && tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'SELECT') return true;
+	}
+	return false;
+}
+
+// Detect pattern: FUNC_NAME ( ... ) where at least one arg contains a subquery
+// Returns { funcName, lpIdx } or null
+function detectFuncWithSubqueryArgs(tokens) {
+	for (let i = 0; i < tokens.length - 1; i++) {
+		const tok = tokens[i];
+		// Function name: KW or ID followed by LP
+		if ((tok.t === 'KW' || tok.t === 'ID') && tokens[i + 1]?.t === 'LP') {
+			const rpIdx = findMatchingParen(tokens, i + 1);
+			const argToks = tokens.slice(i + 2, rpIdx);
+			if (argHasSubquery(argToks)) {
+				return { funcName: tok.v, lpIdx: i + 1, rpIdx };
+			}
+		}
+	}
+	return null;
+}
+
+// Format a function call whose args may contain subqueries (Rule 19)
+// indent = the base indent for the function's opening line
+// prefix = what goes before the function name (e.g. '\t\t, ' or '')
+// Returns array of lines
+function formatFuncWithSubqueryArgs(tokens, baseIndent, prefix) {
+	tokens = tokens.filter(t => t.t !== 'NL');
+
+	// Find function name and its LP
+	let funcStart = 0;
+	// Skip any leading NOT / comparison operators before the func
+	while (funcStart < tokens.length &&
+		tokens[funcStart].t !== 'KW' && tokens[funcStart].t !== 'ID') funcStart++;
+
+	const funcTok = tokens[funcStart];
+	const lpIdx = funcStart + 1;
+	if (!funcTok || tokens[lpIdx]?.t !== 'LP') return [prefix + tokStr(tokens)];
+
+	const rpIdx = findMatchingParen(tokens, lpIdx);
+	const argTokens = tokens.slice(lpIdx + 1, rpIdx);
+	const afterFunc = tokens.slice(rpIdx + 1); // e.g. = 1, > 0 after closing )
+
+	// Tokens before the function name (e.g. nothing, or some prefix expression)
+	const beforeFunc = tokens.slice(0, funcStart);
+	const beforeStr = beforeFunc.length ? tokStr(beforeFunc) + ' ' : '';
+
+	const argIndent = baseIndent + INDENT;
+	const lines = [];
+
+	// Opening line: prefix + beforeStr + FUNCNAME (
+	lines.push(prefix + beforeStr + funcTok.v + '(');
+
+	// Split args at depth-0 commas
+	const args = splitAtCommas(argTokens);
+
+	args.forEach((argToks, ai) => {
+		argToks = argToks.filter(t => t.t !== 'NL');
+		const argPrefix = ai === 0 ? argIndent : argIndent + ', ';
+		// Remove the leading ', ' if splitAtCommas already stripped commas (it does)
+		// ai===0 → argIndent, ai>0 → argIndent + ', ' but comma was already split off
+		const linePrefix = ai === 0 ? argIndent : argIndent;
+
+		if (argHasSubquery(argToks)) {
+			// Subquery arg: expand it
+			// Find the ( SELECT
+			let sqStart = -1;
+			for (let j = 0; j < argToks.length - 1; j++) {
+				if (argToks[j].t === 'LP' && argToks[j+1]?.t === 'KW' && argToks[j+1]?.v === 'SELECT') {
+					sqStart = j; break;
+				}
+			}
+			if (sqStart >= 0) {
+				const sqEnd = findMatchingParen(argToks, sqStart);
+				const beforeSq = argToks.slice(0, sqStart);
+				const sqInner = argToks.slice(sqStart + 1, sqEnd);
+				const afterSq = argToks.slice(sqEnd + 1);
+				const comma = ai > 0 ? ', ' : '';
+
+				if (beforeSq.length) lines.push(linePrefix + comma + tokStr(beforeSq));
+				lines.push((beforeSq.length ? argIndent + INDENT : linePrefix + comma) + '(');
+				const sqFmt = formatSelectStatement(sqInner, true);
+				const sqIndent = beforeSq.length ? argIndent + INDENT + INDENT : argIndent + INDENT;
+				sqFmt.split('\n').forEach(l => lines.push(sqIndent + l));
+				lines.push((beforeSq.length ? argIndent + INDENT : linePrefix + comma.replace(', ','')) + ')');
+				if (afterSq.length) lines.push(argIndent + tokStr(afterSq));
+			} else {
+				lines.push(linePrefix + (ai > 0 ? ', ' : '') + tokStr(argToks));
+			}
+		} else {
+			// Scalar arg
+			lines.push(linePrefix + (ai > 0 ? ', ' : '') + tokStr(argToks));
+		}
+	});
+
+	// Closing ) of function
+	const afterStr = afterFunc.length ? ' ' + tokStr(afterFunc) : '';
+	lines.push(baseIndent + ')' + afterStr);
+
+	return lines;
+}
+
+
 function formatColumnWithEmbeddedSubquery(tokens, idx) {
 	tokens = tokens.filter(t => t.t !== 'NL');
 	const { expr, alias } = extractAlias(tokens);
 	const aliasStr = alias ? ' ' + bracketAlias(alias) : '';
+	const ind2 = INDENT + INDENT;
 
+	// Rule 19: if the expr is a function call with subquery args, use full arg expansion
+	const funcMatch = detectFuncWithSubqueryArgs(expr);
+	if (funcMatch) {
+		const fmtLines = formatFuncWithSubqueryArgs(expr, ind2 + INDENT, ind2 + ', ');
+		// First line: replace leading '\t\t, ' prefix — handled by caller for idx===0
+		// Last line gets alias appended
+		fmtLines[fmtLines.length - 1] = fmtLines[fmtLines.length - 1].trimEnd() + (aliasStr ? aliasStr : '');
+		return { isMultiLine: true, isLong: false, lines: fmtLines };
+	}
+
+	// Fallback: single embedded subquery (original logic)
 	let sqStart = -1;
 	for (let j = 0; j < expr.length - 1; j++) {
 		if (expr[j].t === 'LP' && expr[j + 1]?.t === 'KW' && expr[j + 1]?.v === 'SELECT') { sqStart = j; break; }
@@ -411,9 +579,8 @@ function formatColumnWithEmbeddedSubquery(tokens, idx) {
 	const afterToks  = expr.slice(sqEnd + 1);
 
 	const sqFmt = formatSelectStatement(subToks, true);
-	const ind2 = INDENT + INDENT;
-	const ind3 = INDENT + INDENT + INDENT;
-	const ind4 = INDENT + INDENT + INDENT + INDENT;
+	const ind3 = ind2 + INDENT;
+	const ind4 = ind2 + INDENT + INDENT;
 
 	const lines = [];
 	const lastBefore = beforeToks[beforeToks.length - 1];
@@ -437,11 +604,17 @@ function formatColumnWithEmbeddedSubquery(tokens, idx) {
 
 function parseSelectColumn(tokens, idx) {
 	tokens = tokens.filter(t => t.t !== 'NL');
+	// FIX 4: Extract LEADING standalone comments before the column expression
+	const leadingComments = [];
+	while (tokens.length && tokens[0].t === 'COMMENT') leadingComments.push(tokens.shift());
+	// Strip trailing source comments — formatter adds its own
 	while (tokens.length && tokens[tokens.length - 1].t === 'COMMENT') tokens = tokens.slice(0, -1);
 
-	if (tokens[0]?.t === 'KW' && tokens[0]?.v === 'CASE') return formatCaseColumn(tokens, idx, false);
-	if (tokens[0]?.t === 'LP' && tokens[1]?.t === 'KW' && tokens[1]?.v === 'CASE') return formatCaseColumn(tokens, idx, true);
-	if (tokens[0]?.t === 'LP' && tokens[1]?.t === 'KW' && tokens[1]?.v === 'SELECT') return formatSubqueryColumn(tokens, idx);
+	const wrapComments = result => ({ ...result, leadingComments });
+
+	if (tokens[0]?.t === 'KW' && tokens[0]?.v === 'CASE') return wrapComments(formatCaseColumn(tokens, idx, false));
+	if (tokens[0]?.t === 'LP' && tokens[1]?.t === 'KW' && tokens[1]?.v === 'CASE') return wrapComments(formatCaseColumn(tokens, idx, true));
+	if (tokens[0]?.t === 'LP' && tokens[1]?.t === 'KW' && tokens[1]?.v === 'SELECT') return wrapComments(formatSubqueryColumn(tokens, idx));
 
 	const hasOver = tokens.some(t => t.t === 'KW' && t.v === 'OVER');
 	const { expr, alias } = extractAlias(tokens);
@@ -454,7 +627,7 @@ function parseSelectColumn(tokens, idx) {
 
 	const isLong = hasOver || mainLine.length > MAX_INLINE_COL_LEN || tokens.some(t => LONG_COL_KWS.has(t.v));
 
-	return { isMultiLine: false, isLong, mainLine };
+	return wrapComments({ isMultiLine: false, isLong, mainLine });
 }
 
 function formatCaseColumn(tokens, idx, hasOuterParens) {
@@ -504,22 +677,40 @@ function emitCaseLines(tokens, indent) {
 			i++;
 			const whenToks = [];
 			while (i < tokens.length && tokens[i].v !== 'THEN') whenToks.push(tokens[i++]);
-			lines.push(indent + INDENT + 'WHEN ' + tokStr(whenToks));
+			// Rule 19: subquery in WHEN condition — expand it
+			if (hasEmbeddedSubquery(whenToks) && detectFuncWithSubqueryArgs(whenToks)) {
+				const whenLines = formatFuncWithSubqueryArgs(whenToks, indent + INDENT + INDENT, indent + INDENT + 'WHEN ');
+				lines.push(...whenLines);
+			} else {
+				lines.push(indent + INDENT + 'WHEN ' + tokStr(whenToks));
+			}
 			if (tokens[i]?.v === 'THEN') i++;
 			const thenToks = [];
+			// Peek: is the THEN value a nested CASE?
+			const thenIsCase = tokens[i]?.v === 'CASE';
 			while (i < tokens.length && !['WHEN','ELSE','END'].includes(tokens[i].v)) {
 				if (tokens[i].v === 'CASE') {
 					const cnt = collectCaseBlock(tokens, i);
-					lines.push(...emitCaseLines(tokens.slice(i, i + cnt), indent + INDENT + INDENT));
+					// Rule 10: emit THEN on its own line, then nested CASE indented one more level
+					lines.push(indent + INDENT + INDENT + 'THEN');
+					lines.push(...emitCaseLines(tokens.slice(i, i + cnt), indent + INDENT + INDENT + INDENT));
 					i += cnt;
 				} else { thenToks.push(tokens[i++]); }
 			}
 			if (thenToks.length) lines.push(indent + INDENT + INDENT + 'THEN ' + tokStr(thenToks));
 		} else if (tok.v === 'ELSE') {
 			i++;
-			const elseToks = [];
-			while (i < tokens.length && tokens[i].v !== 'END') elseToks.push(tokens[i++]);
-			lines.push(indent + INDENT + 'ELSE ' + tokStr(elseToks));
+			// Rule 10: if ELSE value is a nested CASE, expand it
+			if (tokens[i]?.v === 'CASE') {
+				const cnt = collectCaseBlock(tokens, i);
+				lines.push(indent + INDENT + 'ELSE');
+				lines.push(...emitCaseLines(tokens.slice(i, i + cnt), indent + INDENT + INDENT));
+				i += cnt;
+			} else {
+				const elseToks = [];
+				while (i < tokens.length && tokens[i].v !== 'END') elseToks.push(tokens[i++]);
+				lines.push(indent + INDENT + 'ELSE ' + tokStr(elseToks));
+			}
 		} else if (tok.v === 'END') {
 			i++;
 		} else { i++; }
@@ -705,7 +896,8 @@ function formatTableRef(tokens) {
 	const notFn = !expr.some(t => t.t === 'LP');
 	const notTVF = !TVF_NAMES.has(tableStr.toUpperCase());
 	const notKw = !KEYWORDS.has(tableStr.toUpperCase()) || DATATYPES.has(tableStr.toUpperCase());
-	if (noSchema && notSpecial && notFn && notTVF && notKw) tableStr = 'dbo.' + tableStr;
+	const notCTE = !_cteNames.has(tableStr.toLowerCase());
+	if (noSchema && notSpecial && notFn && notTVF && notKw && notCTE) tableStr = 'dbo.' + tableStr;
 
 	const aliasPart = alias ? ' ' + bracketAlias(alias) : '';
 	return tableStr + aliasPart + hintStr;
@@ -867,6 +1059,17 @@ function formatConditionGroup(tokens) {
 		}
 	}
 
+	// Rule 19: function call with embedded subquery in WHERE/HAVING condition
+	// formatFuncWithSubqueryArgs returns lines with built-in indentation relative to baseIndent.
+	// Return as a single "line" that the caller won't double-indent by joining with \n
+	// and wrapping in a special format the caller can detect.
+	// Simplest correct approach: use baseIndent='' so lines are unindented,
+	// the caller (formatConditionBlock / formatWhereClause) will prepend INDENT+INDENT normally.
+	// Internal structure uses INDENT for each nesting level relative to ''.
+	if (detectFuncWithSubqueryArgs(tokens)) {
+		return formatFuncWithSubqueryArgs(tokens, '', '');
+	}
+
 	return [tokStr(tokens)];
 }
 
@@ -957,10 +1160,107 @@ function formatHavingClause(clauseTokens) {
 	return lines.join('\n');
 }
 
-function formatDeclareClause(clauseTokens) {
-	// FIX #2: Remove AS keyword from DECLARE — Rule 3 strictly forbids AS in DECLARE
+// Dispatcher for CREATE — routes TABLE to the column formatter, others passthrough
+function formatCreateClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	const first = clauseTokens[0];
+	if ((first?.t === 'DT' || first?.t === 'KW') && first?.v === 'TABLE') {
+		return formatCreateTableClause(clauseTokens);
+	}
+	// CREATE PROCEDURE handled by formatProcStatement at batch level
+	// Everything else — passthrough
+	return 'CREATE ' + tokStr(clauseTokens);
+}
+
+// ── Missing 1: CREATE TABLE column list formatting ──
+function formatCreateTableClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	// clauseTokens = TABLE dbo.tabName (col defs...)
+	// or just dbo.tabName (col defs...)
+	let i = 0;
+
+	// Skip TABLE keyword if present (comes through as DT token)
+	if (clauseTokens[i]?.t === 'DT' && clauseTokens[i]?.v === 'TABLE') i++;
+
+	// Collect table name (up to LP)
+	const nameToks = [];
+	while (i < clauseTokens.length && clauseTokens[i].t !== 'LP') {
+		nameToks.push(clauseTokens[i++]);
+	}
+	let tableName = tokStr(nameToks).trim();
+	if (tableName && !tableName.includes('.') && !/^[@#]/.test(tableName)) {
+		tableName = 'dbo.' + tableName;
+	}
+
+	if (clauseTokens[i]?.t !== 'LP') return 'CREATE TABLE ' + tableName;
+
+	const parenEnd = findMatchingParen(clauseTokens, i);
+	const colToks = clauseTokens.slice(i + 1, parenEnd);
+	const cols = splitAtCommas(colToks);
+
+	const lines = ['CREATE TABLE ' + tableName];
+	lines.push('(');
+	cols.forEach((ct, ci) => {
+		lines.push(INDENT + (ci === 0 ? '  ' : ', ') + tokStr(ct).trim());
+	});
+	lines.push(')');
+	return lines.join('\n');
+}
+
+// ── Missing 2: DECLARE @t TABLE column list ──
+function formatDeclareTableVar(clauseTokens) {
 	clauseTokens = clauseTokens.filter(t => t.t !== 'NL' && !(t.t === 'KW' && t.v === 'AS'));
+	// clauseTokens = @VarName TABLE (col1 TYPE, col2 TYPE, ...)
+	let i = 0;
+	const varTok = clauseTokens[i++]; // @VarName
+	// Skip TABLE keyword
+	if (clauseTokens[i]?.v === 'TABLE' || clauseTokens[i]?.t === 'DT') i++;
+
+	if (clauseTokens[i]?.t !== 'LP') {
+		return 'DECLARE ' + tokStr(clauseTokens);
+	}
+
+	const parenEnd = findMatchingParen(clauseTokens, i);
+	const colToks = clauseTokens.slice(i + 1, parenEnd);
+	const cols = splitAtCommas(colToks);
+
+	const lines = ['DECLARE ' + varTok.v + ' TABLE'];
+	lines.push('(');
+	cols.forEach((ct, ci) => {
+		lines.push(INDENT + (ci === 0 ? '  ' : ', ') + tokStr(ct).trim());
+	});
+	lines.push(')');
+	return lines.join('\n');
+}
+
+function formatDeclareClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	// Missing 2: DECLARE @Var TABLE (col list) — format column list
+	if (clauseTokens[0]?.t === 'VAR') {
+		let j = 1;
+		if (clauseTokens[j]?.t === 'KW' && clauseTokens[j]?.v === 'AS') j++;
+		if (clauseTokens[j]?.v === 'TABLE' && clauseTokens[j + 1]?.t === 'LP') {
+			return formatDeclareTableVar(clauseTokens);
+		}
+	}
+	// FIX #2: Remove AS keyword from DECLARE — Rule 3 strictly forbids AS in DECLARE
+	clauseTokens = clauseTokens.filter(t => !(t.t === 'KW' && t.v === 'AS'));
 	return 'DECLARE ' + tokStr(clauseTokens);
+}
+
+// Dispatch SET to proc-style or UPDATE-style based on first token
+function formatSetDispatch(clauseTokens) {
+	const filtered = clauseTokens.filter(t => t.t !== 'NL');
+	const first = filtered[0];
+	// Proc SET: starts with @variable
+	// UPDATE SET: starts with column name (ID or BID), no leading @
+	if (first?.t === 'VAR') return formatSetClause(filtered);
+	// Check for multiple assignments (comma at depth 0 = UPDATE SET)
+	const assignments = splitAtCommas(filtered);
+	if (assignments.length > 1) return formatUpdateSetClause(filtered);
+	// Single col = val without @ — still UPDATE SET style
+	if (first?.t === 'ID' || first?.t === 'BID') return formatUpdateSetClause(filtered);
+	return formatSetClause(filtered);
 }
 
 function formatSetClause(clauseTokens) {
@@ -1099,9 +1399,95 @@ function formatWhileClause(clauseTokens, indent) {
 	return lines.join('\n');
 }
 
+// ── FIX 5: TRY/CATCH extractor ──
+function extractTryCatch(tokens) {
+	// Find BEGIN TRY at depth 0
+	let tryStart = -1;
+	for (let i = 0; i < tokens.length - 1; i++) {
+		if (tokens[i].t === 'KW' && tokens[i].v === 'BEGIN' &&
+			tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'TRY') {
+			tryStart = i; break;
+		}
+	}
+	if (tryStart < 0) return null;
+
+	const before = tokens.slice(0, tryStart);
+	let i = tryStart + 2; // skip BEGIN TRY
+
+	// Collect TRY body until END TRY
+	const tryBody = [];
+	let depth = 0;
+	while (i < tokens.length) {
+		const t = tokens[i];
+		if (t.t === 'KW' && t.v === 'BEGIN') depth++;
+		if (t.t === 'KW' && t.v === 'END') {
+			if (depth > 0) { depth--; tryBody.push(t); i++; continue; }
+			// depth 0 END — check if followed by TRY
+			if (tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'TRY') { i += 2; break; }
+		}
+		tryBody.push(t); i++;
+	}
+
+	// Expect BEGIN CATCH
+	if (!(tokens[i]?.t === 'KW' && tokens[i]?.v === 'BEGIN' &&
+		  tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'CATCH')) return null;
+	i += 2; // skip BEGIN CATCH
+
+	// Collect CATCH body until END CATCH
+	const catchBody = [];
+	depth = 0;
+	while (i < tokens.length) {
+		const t = tokens[i];
+		if (t.t === 'KW' && t.v === 'BEGIN') depth++;
+		if (t.t === 'KW' && t.v === 'END') {
+			if (depth > 0) { depth--; catchBody.push(t); i++; continue; }
+			if (tokens[i + 1]?.t === 'KW' && tokens[i + 1]?.v === 'CATCH') { i += 2; break; }
+		}
+		catchBody.push(t); i++;
+	}
+
+	const after = tokens.slice(i);
+	return { before, tryBody, catchBody, after };
+}
+
 function formatProcBody(tokens, indent = INDENT) {
 	tokens = tokens.filter(t => t.t !== 'NL');
-	const clauses = splitIntoClauses(tokens);
+
+	// ── FIX 5: Handle BEGIN TRY...END TRY BEGIN CATCH...END CATCH ──
+	// Scan for BEGIN TRY at depth 0 and extract the blocks before clause splitting
+	const tryResult = extractTryCatch(tokens);
+	if (tryResult) {
+		const lines = [];
+		// Format any statements before BEGIN TRY
+		if (tryResult.before.length) {
+			formatProcBody(tryResult.before, indent).forEach(l => lines.push(l));
+			if (lines.length && lines[lines.length - 1] !== '') lines.push('');
+		}
+		lines.push('BEGIN TRY');
+		lines.push('');
+		formatProcBody(tryResult.tryBody, indent + INDENT).forEach(l =>
+			lines.push(l === '' ? '' : INDENT + l));
+		lines.push('');
+		lines.push('END TRY');
+		lines.push('BEGIN CATCH');
+		lines.push('');
+		formatProcBody(tryResult.catchBody, indent + INDENT).forEach(l =>
+			lines.push(l === '' ? '' : INDENT + l));
+		lines.push('');
+		lines.push('END CATCH');
+		// Format any statements after END CATCH
+		if (tryResult.after.length) {
+			lines.push('');
+			formatProcBody(tryResult.after, indent).forEach(l => lines.push(l));
+		}
+		// Trim trailing blanks + add rule-16 blank before END
+		while (lines.length && lines[lines.length - 1] === '') lines.pop();
+		lines.push('');
+		return lines;
+	}
+
+	let clauses = splitIntoClauses(tokens);
+	clauses = mergeDeleteClauses(clauses);
 	const lines = [];
 
 	let ci = 0;
@@ -1156,6 +1542,169 @@ function formatProcBody(tokens, indent = INDENT) {
 	while (lines.length && lines[lines.length - 1] === '') lines.pop();
 	lines.push(''); // Rule 16: blank line before END
 	return lines;
+}
+
+// ── FIX 1: SELECT INTO #TempTable ──
+function formatIntoClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	if (!clauseTokens.length) return 'INTO';
+	// clauseTokens = #TempTable or @TableVar
+	return 'INTO\t' + tokStr(clauseTokens);
+}
+
+// ── FIX 7: MERGE statement ──
+function formatMergeClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	const lines = [];
+	let i = 0;
+
+	// Collect target table (up to USING)
+	const targetToks = [];
+	while (i < clauseTokens.length && clauseTokens[i].v !== 'USING') {
+		targetToks.push(clauseTokens[i++]);
+	}
+	lines.push('MERGE ' + formatTableRef(targetToks));
+
+	if (clauseTokens[i]?.v === 'USING') i++;
+
+	// Collect source table (up to ON)
+	const sourceToks = [];
+	while (i < clauseTokens.length && clauseTokens[i].v !== 'ON') {
+		sourceToks.push(clauseTokens[i++]);
+	}
+	lines.push('USING ' + formatTableRef(sourceToks));
+
+	if (clauseTokens[i]?.v === 'ON') i++;
+
+	// Collect ON condition (up to first WHEN)
+	const onToks = [];
+	while (i < clauseTokens.length && clauseTokens[i].v !== 'WHEN') {
+		onToks.push(clauseTokens[i++]);
+	}
+	const onConds = splitAtTopKws(onToks, new Set(['AND', 'OR']));
+	onConds.forEach(({ kw, tokens: ct }, ci) => {
+		if (!ct.length) return;
+		lines.push(ci === 0
+			? INDENT + 'ON' + INDENT + tokStr(ct)
+			: INDENT + kw + INDENT + tokStr(ct));
+	});
+
+	// Parse WHEN ... THEN ... blocks
+	while (i < clauseTokens.length && (clauseTokens[i]?.v === 'WHEN')) {
+		i++; // skip WHEN
+		// Collect WHEN condition (NOT MATCHED / MATCHED [AND ...])
+		const whenToks = [];
+		while (i < clauseTokens.length && clauseTokens[i]?.v !== 'THEN') {
+			whenToks.push(clauseTokens[i++]);
+		}
+		lines.push('WHEN ' + tokStr(whenToks));
+		if (clauseTokens[i]?.v === 'THEN') i++;
+
+		// Determine action: UPDATE SET / INSERT / DELETE
+		const actionKw = clauseTokens[i]?.v;
+		if (actionKw === 'UPDATE') {
+			i++;
+			if (clauseTokens[i]?.v === 'SET') i++;
+			// Collect SET assignments until WHEN/semicolon/end
+			const setToks = [];
+			while (i < clauseTokens.length && clauseTokens[i]?.v !== 'WHEN') {
+				setToks.push(clauseTokens[i++]);
+			}
+			const assignments = splitAtCommas(setToks);
+			lines.push(INDENT + 'THEN UPDATE SET');
+			assignments.forEach((a, ai) => {
+				lines.push(INDENT + INDENT + (ai === 0 ? '  ' : ', ') + tokStr(a));
+			});
+		} else if (actionKw === 'INSERT') {
+			i++;
+			// Optional column list
+			let colList = '';
+			if (clauseTokens[i]?.t === 'LP') {
+				const colEnd = findMatchingParen(clauseTokens, i);
+				const colToks = clauseTokens.slice(i + 1, colEnd);
+				colList = '(' + splitAtCommas(colToks).map(c => tokStr(c)).join(', ') + ')';
+				i = colEnd + 1;
+			}
+			lines.push(INDENT + 'THEN INSERT ' + colList);
+			// VALUES
+			if (clauseTokens[i]?.v === 'VALUES') {
+				i++;
+				if (clauseTokens[i]?.t === 'LP') {
+					const valEnd = findMatchingParen(clauseTokens, i);
+					const valToks = clauseTokens.slice(i + 1, valEnd);
+					const vals = splitAtCommas(valToks);
+					lines.push(INDENT + INDENT + '  VALUES (');
+					vals.forEach((v, vi) => {
+						lines.push(INDENT + INDENT + INDENT + (vi === 0 ? '  ' : ', ') + tokStr(v));
+					});
+					lines.push(INDENT + INDENT + '  )');
+					i = valEnd + 1;
+				}
+			}
+		} else if (actionKw === 'DELETE') {
+			i++;
+			lines.push(INDENT + 'THEN DELETE');
+		}
+	}
+
+	// Optional OUTPUT clause
+	if (clauseTokens[i]?.v === 'OUTPUT') {
+		lines.push('');
+		const outToks = [];
+		i++;
+		while (i < clauseTokens.length) outToks.push(clauseTokens[i++]);
+		lines.push('OUTPUT ' + tokStr(outToks));
+	}
+
+	lines.push(';');
+	return lines.join('\n');
+}
+
+// ── FIX 6: UPDATE + UPDATE SET ──
+function formatUpdateClause(clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	if (!clauseTokens.length) return 'UPDATE';
+	// clauseTokens = table ref (everything before SET/FROM/WHERE which are separate clauses)
+	const tableStr = formatTableRef(clauseTokens);
+	return 'UPDATE ' + tableStr;
+}
+
+function formatUpdateSetClause(clauseTokens) {
+	// Called when SET appears after UPDATE (not a proc variable SET)
+	// clauseTokens = col1 = val1, col2 = val2, ...
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	const assignments = splitAtCommas(clauseTokens);
+	// Always one assignment per line with tab alignment
+	const lines = ['SET\t' + tokStr(assignments[0])];
+	assignments.slice(1).forEach(a => lines.push('\t\t, ' + tokStr(a)));
+	return lines.join('\n');
+}
+
+// ── FIX 8: DELETE FROM ──
+function formatDeleteClause(clauseTokens) {
+	// clauseTokens = the FROM clause tokens (table ref + optional joins/where absorbed by mergeDeleteClauses)
+	// clauseTokens may also have a leading alias for DELETE t FROM tabX style
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	if (!clauseTokens.length) return 'DELETE FROM';
+
+	// Handle DELETE [alias] FROM table style — if first token is ID before FROM keyword
+	let deleteAlias = '';
+	let i = 0;
+	if (clauseTokens[i]?.t !== 'KW' && clauseTokens[i]?.t !== 'ID' &&
+		clauseTokens.some(t => t.t === 'KW' && t.v === 'FROM')) {
+		// alias before FROM — skip it for now, handled by FROM clause
+	}
+
+	// Collect table ref (everything before WHERE/JOIN keywords)
+	const tableToks = [];
+	while (i < clauseTokens.length) {
+		const t = clauseTokens[i];
+		if (t.t === 'KW' && ['WHERE','INNER','LEFT','RIGHT','FULL','CROSS','JOIN','OUTPUT'].includes(t.v)) break;
+		tableToks.push(t); i++;
+	}
+	const tableStr = formatTableRef(tableToks);
+	const lines = ['DELETE FROM ' + tableStr];
+	return lines.join('\n');
 }
 
 function formatInsertClause(clauseTokens) {
@@ -1404,6 +1953,10 @@ function formatCTE(tokens) {
 
 	const mainToks = tokens.slice(i);
 
+	// Register CTE names so formatTableRef doesn't add dbo. prefix
+	_cteNames.clear();
+	cteBlocks.forEach(cte => _cteNames.add(cte.name.toLowerCase().replace(/^\[|\]$/g, '')));
+
 	cteBlocks.forEach((cte, ci) => {
 		if (cte.description) lines.push(cte.description);
 		lines.push(cte.name);
@@ -1443,6 +1996,36 @@ function formatSetOperators(clauses) {
 	return parts.join('\n\n');
 }
 
+// ── FIX 10: EXEC param formatting ──
+function formatExecClause(keyword, clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	if (!clauseTokens.length) return keyword;
+
+	// Collect proc name (up to first @param or end)
+	const nameToks = [];
+	let i = 0;
+	while (i < clauseTokens.length && clauseTokens[i].t !== 'VAR') {
+		nameToks.push(clauseTokens[i++]);
+	}
+	const procName = tokStr(nameToks);
+
+	const paramToks = clauseTokens.slice(i);
+	if (!paramToks.length) return keyword + (procName ? ' ' + procName : '');
+
+	const params = splitAtCommas(paramToks);
+	if (params.length < 3) {
+		// Inline for 1-2 params
+		return keyword + ' ' + procName + ' ' + tokStr(paramToks);
+	}
+
+	// One param per line for 3+ params
+	const lines = [keyword + ' ' + procName];
+	params.forEach((p, pi) => {
+		lines.push((pi === 0 ? INDENT + INDENT + '  ' : INDENT + INDENT + ', ') + tokStr(p));
+	});
+	return lines.join('\n');
+}
+
 function formatClause(clause) {
 	switch (clause.type) {
 		case 'SELECT':   return formatSelectClause(clause.tokens, false);
@@ -1452,23 +2035,44 @@ function formatClause(clause) {
 		case 'GROUP':    return formatGroupByClause(clause.tokens);
 		case 'HAVING':   return formatHavingClause(clause.tokens);
 		case 'DECLARE':  return formatDeclareClause(clause.tokens);
-		case 'SET':      return formatSetClause(clause.tokens);
+		case 'SET':      return formatSetDispatch(clause.tokens);
 		case 'IF':       return formatIfClause(clause.tokens, INDENT);
 		case 'WHILE':    return formatWhileClause(clause.tokens, INDENT);
+		case 'DELETE':   return formatDeleteClause(clause.tokens);
 		case 'INSERT':   return formatInsertClause(clause.tokens).join('\n');
 		case 'RETURN':   return 'RETURN';
 		case 'EXEC':
-		case 'EXECUTE':  return clause.type + (clause.tokens.length ? ' ' + tokStr(clause.tokens) : '');
+		case 'EXECUTE':  return formatExecClause(clause.type, clause.tokens);
 		case 'PRINT':    return 'PRINT ' + tokStr(clause.tokens);
 		case 'RAISERROR':return 'RAISERROR ' + tokStr(clause.tokens);
 		case 'THROW':    return 'THROW ' + tokStr(clause.tokens);
+		case 'MERGE':    return formatMergeClause(clause.tokens);
+		case 'UPDATE':   return formatUpdateClause(clause.tokens);
+		case 'INTO':     return formatIntoClause(clause.tokens);
+		case 'CREATE':   return formatCreateClause(clause.tokens);
 		default:         return clause.type + (clause.tokens.length ? ' ' + tokStr(clause.tokens) : '');
 	}
 }
 
+function mergeDeleteClauses(clauses) {
+	// Merge DELETE clause with its following FROM clause so DELETE FROM is treated as one unit
+	const out = [];
+	for (let i = 0; i < clauses.length; i++) {
+		if (clauses[i].type === 'DELETE' && clauses[i + 1]?.type === 'FROM') {
+			// Absorb FROM tokens into DELETE clause
+			out.push({ type: 'DELETE', tokens: clauses[i + 1].tokens });
+			i++; // skip the FROM clause
+		} else {
+			out.push(clauses[i]);
+		}
+	}
+	return out;
+}
+
 function formatSelectStatement(tokens, noColumnNumbers) {
 	tokens = tokens.filter(t => t.t !== 'NL' && t.t !== 'GO');
-	const clauses = splitIntoClauses(tokens);
+	let clauses = splitIntoClauses(tokens);
+	clauses = mergeDeleteClauses(clauses);
 	const hasSetOps = clauses.some(c => ['UNION','INTERSECT','EXCEPT'].includes(c.type));
 	if (hasSetOps) return formatSetOperators(clauses);
 	return clauses.map(c => {
@@ -1526,10 +2130,33 @@ function formatBatch(tokens) {
 		return formatCTE(tokens.slice(withIdx + 1));
 	}
 
+	// TRY/CATCH at batch level
+	const tryCatch = extractTryCatch(tokens);
+	if (tryCatch) {
+		const lines = [];
+		if (tryCatch.before.length) lines.push(formatBatch(tryCatch.before));
+		lines.push('BEGIN TRY');
+		lines.push('');
+		formatProcBody(tryCatch.tryBody, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
+		lines.push('');
+		lines.push('END TRY');
+		lines.push('BEGIN CATCH');
+		lines.push('');
+		formatProcBody(tryCatch.catchBody, INDENT).forEach(l => lines.push(l === '' ? '' : INDENT + l));
+		lines.push('');
+		lines.push('END CATCH');
+		if (tryCatch.after.length) { lines.push(''); lines.push(formatBatch(tryCatch.after)); }
+		return lines.filter(l => l != null).join('\n');
+	}
+
 	return formatSelectStatement(tokens, false);
 }
 
-function formatSQL(sql) {
+function formatSQL(sql, options = {}) {
+	// Apply configurable options
+	if (typeof options.maxInlineColLen === 'number') MAX_INLINE_COL_LEN = options.maxInlineColLen;
+	if (typeof options.inListBreakAt   === 'number') IN_LIST_BREAK_AT   = options.inListBreakAt;
+
 	try {
 		const tokens = tokenize(sql);
 		if (!tokens.length) return sql;
@@ -1558,8 +2185,9 @@ function formatSQL(sql) {
 		return formatted.join('\nGO\n');
 
 	} catch (err) {
+		// Missing 5: re-throw so extension.js can show the actual error message
 		console.error('[SQL Zero Doctrine] formatter error:', err);
-		return sql;
+		throw err;
 	}
 }
 
