@@ -36,6 +36,16 @@ function setStatusError() {
 	setStatus('$(error)', 'ZD', 'Zero Doctrine: formatting failed — click to retry');
 }
 
+// --- Read user config ---
+function getOptions() {
+	const config = vscode.workspace.getConfiguration('sqlZeroDoctrine');
+	return {
+		inListBreakAt:   config.get('inListBreakAt', 4),
+		maxInlineColLen: config.get('maxInlineColLen', 80),
+		reorderJoinOn:   config.get('reorderJoinOn', false),
+	};
+}
+
 // --- Providers (Shift+Alt+F path — direct apply, no diff preview) ---
 function runFormatter(document) {
 	const fullText = document.getText();
@@ -44,7 +54,7 @@ function runFormatter(document) {
 	setStatusFormatting();
 	let formatted = '';
 	try {
-		formatted = formatSQL(fullText);
+		formatted = formatSQL(fullText, getOptions());
 	} catch (err) {
 		vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
 		setStatusError();
@@ -66,7 +76,7 @@ function runFormatterForSelection(document, range) {
 	setStatusFormatting();
 	let formatted = '';
 	try {
-		formatted = formatSQL(selectedText);
+		formatted = formatSQL(selectedText, getOptions());
 	} catch (err) {
 		vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
 		setStatusError();
@@ -85,7 +95,7 @@ async function formatWithPreview(editor, sql, range) {
 	setStatusFormatting();
 	let formatted = '';
 	try {
-		formatted = formatSQL(sql);
+		formatted = formatSQL(sql, getOptions());
 	} catch (err) {
 		vscode.window.showErrorMessage(`❌ Formatting failed: ${err.message}`);
 		setStatusError();

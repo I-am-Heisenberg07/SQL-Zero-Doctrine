@@ -37,7 +37,7 @@ const KEYWORDS = new Set([
 	'ABS','CEILING','FLOOR','ROUND','POWER','SQRT',
 	'NEWID','OBJECT_ID','OBJECT_NAME','SCHEMA_NAME',
 	'NOLOCK','UPDLOCK','ROWLOCK','TABLOCK','READPAST','READUNCOMMITTED',
-	'ROWS','RANGE','PRECEDING','FOLLOWING','ONLY','OFFSET','NEXT',
+	'ROWS','RANGE','PRECEDING','FOLLOWING','ONLY','OFFSET','NEXT','UNBOUNDED',
 	'APPLY','OUTPUT',
 	'THROW','TRY','CATCH',
 	'STRING_SPLIT','OPENJSON',
@@ -71,8 +71,9 @@ const LONG_COL_KWS = new Set([
 	'ROW_NUMBER','RANK','DENSE_RANK','FIRST_VALUE','LAST_VALUE','LAG','LEAD',
 ]);
 
-let MAX_INLINE_COL_LEN = 80; // configurable via formatSQL options
-let IN_LIST_BREAK_AT   = 4;  // configurable via formatSQL options
+let MAX_INLINE_COL_LEN    = 80;    // configurable via formatSQL options
+let IN_LIST_BREAK_AT      = 4;     // configurable via formatSQL options
+let REORDER_JOIN_ON       = false; // if true, rewrite ON so joined table is on left side
 
 function tokenize(sql) {
 	const tokens = [];
@@ -280,6 +281,10 @@ const TOP_CLAUSE_KWS = new Set([
 	'DECLARE','SET','IF','WHILE',
 	'RETURN','EXEC','EXECUTE','PRINT','RAISERROR','THROW',
 	'INTO',
+	// Rob 2: previously fell through to _ passthrough
+	'USE','TRUNCATE','DBCC','GRANT','REVOKE','WAITFOR',
+	'CHECKPOINT','SAVE','CLOSE','DEALLOCATE','OPEN','KILL',
+	'DISABLE','ENABLE','BACKUP','RESTORE',
 ]);
 
 // Keywords that are NOT clause starters when inside a MERGE body
@@ -602,6 +607,53 @@ function formatColumnWithEmbeddedSubquery(tokens, idx) {
 	return { isMultiLine: true, isLong: false, lines };
 }
 
+// ── OVER clause expansion (Rule 20) ──
+function shouldExpandOver(overInnerTokens) {
+	// Expand if: has PARTITION BY, OR has ROWS/RANGE BETWEEN, OR is long
+	const inner = tokStr(overInnerTokens);
+	return inner.length > 40 ||
+		overInnerTokens.some(t => t.v === 'PARTITION') ||
+		overInnerTokens.some(t => t.v === 'ROWS' || t.v === 'RANGE');
+}
+
+function formatOverClause(funcStr, overInnerTokens, baseIndent) {
+	// funcStr  = 'ROW_NUMBER()' or 'SUM(Salary)'
+	// overInnerTokens = tokens inside OVER(...)
+	// baseIndent = indent for the closing )
+	const innerIndent = baseIndent + INDENT + INDENT;
+
+	// Split OVER contents at PARTITION/ORDER/ROWS/RANGE keywords
+	const lines = [funcStr + ' OVER ('];
+
+	const parts = splitAtTopKws(
+		overInnerTokens.filter(t => t.t !== 'NL'),
+		new Set(['PARTITION', 'ORDER', 'ROWS', 'RANGE'])
+	).filter(p => p.tokens.length > 0 || p.kw);
+
+	parts.forEach(({ kw, tokens: pt }) => {
+		if (!kw && !pt.length) return;
+		if (kw === 'PARTITION') {
+			// PARTITION BY col1, col2
+			const byIdx = pt.findIndex(t => t.v === 'BY');
+			const colToks = byIdx >= 0 ? pt.slice(byIdx + 1) : pt;
+			const cols = splitAtCommas(colToks);
+			lines.push(innerIndent + 'PARTITION BY ' + cols.map(c => tokStr(c)).join(', '));
+		} else if (kw === 'ORDER') {
+			const byIdx = pt.findIndex(t => t.v === 'BY');
+			const colToks = byIdx >= 0 ? pt.slice(byIdx + 1) : pt;
+			const cols = splitAtCommas(colToks);
+			lines.push(innerIndent + 'ORDER BY ' + cols.map(c => tokStr(c)).join(', '));
+		} else if (kw === 'ROWS' || kw === 'RANGE') {
+			lines.push(innerIndent + kw + ' ' + tokStr(pt));
+		} else if (pt.length) {
+			lines.push(innerIndent + tokStr(pt));
+		}
+	});
+
+	lines.push(baseIndent + INDENT + ')');
+	return lines.join('\n');
+}
+
 function parseSelectColumn(tokens, idx) {
 	tokens = tokens.filter(t => t.t !== 'NL');
 	// FIX 4: Extract LEADING standalone comments before the column expression
@@ -619,11 +671,29 @@ function parseSelectColumn(tokens, idx) {
 	const hasOver = tokens.some(t => t.t === 'KW' && t.v === 'OVER');
 	const { expr, alias } = extractAlias(tokens);
 
-	if (hasEmbeddedSubquery(expr)) return formatColumnWithEmbeddedSubquery(tokens, idx);
+	if (hasEmbeddedSubquery(expr)) return wrapComments(formatColumnWithEmbeddedSubquery(tokens, idx));
 
 	const exprStr = tokStr(expr);
 	const aliasStr = alias ? bracketAlias(alias) : null;
 	const mainLine = aliasStr ? exprStr + ' ' + aliasStr : exprStr;
+
+	// Rule 20: expand OVER clause when it has PARTITION BY, ROWS/RANGE, or is long
+	if (hasOver) {
+		const overIdx = expr.findIndex(t => t.t === 'KW' && t.v === 'OVER');
+		if (overIdx >= 0 && expr[overIdx + 1]?.t === 'LP') {
+			const overEnd = findMatchingParen(expr, overIdx + 1);
+			const overInner = expr.slice(overIdx + 2, overEnd);
+			if (shouldExpandOver(overInner)) {
+				const funcStr = tokStr(expr.slice(0, overIdx));
+				const aliasStr2 = alias ? ' ' + bracketAlias(alias) : '';
+				const ind2 = INDENT + INDENT;
+				const overLines = formatOverClause(funcStr, overInner, ind2).split('\n');
+				const colLines = [ind2 + ', ' + overLines[0], ...overLines.slice(1)];
+				colLines[colLines.length - 1] += aliasStr2;
+				return wrapComments({ isMultiLine: true, isLong: false, lines: colLines });
+			}
+		}
+	}
 
 	const isLong = hasOver || mainLine.length > MAX_INLINE_COL_LEN || tokens.some(t => LONG_COL_KWS.has(t.v));
 
@@ -828,7 +898,7 @@ function formatFromClause(clauseTokens) {
 			const conditions = splitAtTopKws(onToks, new Set(['AND', 'OR']));
 			conditions.forEach(({ kw, tokens: ct }, ci) => {
 				if (!ct.length) return;
-				const ordered = joinedTable ? reorderOnCondition(ct, joinedTable) : ct;
+				const ordered = (REORDER_JOIN_ON && joinedTable) ? reorderOnCondition(ct, joinedTable) : ct;
 				lines.push(ci === 0
 					? INDENT + INDENT + INDENT + 'ON' + INDENT + tokStr(ordered)
 					: INDENT + INDENT + INDENT + kw + INDENT + tokStr(ordered));
@@ -1996,6 +2066,13 @@ function formatSetOperators(clauses) {
 	return parts.join('\n\n');
 }
 
+// ── Rob 2: clean passthrough for statements without dedicated formatters ──
+function formatSimplePassthrough(keyword, clauseTokens) {
+	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
+	if (!clauseTokens.length) return keyword;
+	return keyword + ' ' + tokStr(clauseTokens);
+}
+
 // ── FIX 10: EXEC param formatting ──
 function formatExecClause(keyword, clauseTokens) {
 	clauseTokens = clauseTokens.filter(t => t.t !== 'NL');
@@ -2050,7 +2127,17 @@ function formatClause(clause) {
 		case 'UPDATE':   return formatUpdateClause(clause.tokens);
 		case 'INTO':     return formatIntoClause(clause.tokens);
 		case 'CREATE':   return formatCreateClause(clause.tokens);
-		default:         return clause.type + (clause.tokens.length ? ' ' + tokStr(clause.tokens) : '');
+		// Rob 2: clean passthrough for valid statements without dedicated formatters
+		case 'USE': case 'TRUNCATE': case 'DBCC':
+		case 'GRANT': case 'REVOKE': case 'WAITFOR':
+		case 'CHECKPOINT': case 'SAVE': case 'CLOSE':
+		case 'DEALLOCATE': case 'OPEN': case 'KILL':
+		case 'DISABLE': case 'ENABLE': case 'BACKUP': case 'RESTORE':
+			return formatSimplePassthrough(clause.type, clause.tokens);
+		default:
+			// Strip the _ prefix from unknown-position tokens
+			if (clause.type === '_') return tokStr(clause.tokens);
+			return formatSimplePassthrough(clause.type, clause.tokens);
 	}
 }
 
@@ -2096,6 +2183,13 @@ function splitBatches(tokens) {
 	return batches;
 }
 
+// Statements that must be treated as a single atomic unit — no clause splitting
+const ATOMIC_STMT_KWS = new Set([
+	'USE','GRANT','REVOKE','TRUNCATE','DBCC','WAITFOR',
+	'CHECKPOINT','SAVE','CLOSE','DEALLOCATE','OPEN','KILL',
+	'DISABLE','ENABLE','BACKUP','RESTORE',
+]);
+
 function formatBatch(tokens) {
 	tokens = tokens.filter(t => t.t !== 'NL');
 	if (!tokens.length) return null;
@@ -2107,6 +2201,11 @@ function formatBatch(tokens) {
 	const firstKw = tokens.find(t => t.t === 'KW');
 	if (!firstKw) {
 		return tokStr(tokens);
+	}
+
+	// Rob 2: atomic statements — pass through without clause splitting
+	if (ATOMIC_STMT_KWS.has(firstKw.v)) {
+		return firstKw.v + (tokens.length > 1 ? ' ' + tokStr(tokens.filter(t => t !== firstKw)) : '');
 	}
 
 	if (firstKw.v === 'CREATE' || firstKw.v === 'ALTER') {
@@ -2153,9 +2252,13 @@ function formatBatch(tokens) {
 }
 
 function formatSQL(sql, options = {}) {
-	// Apply configurable options
-	if (typeof options.maxInlineColLen === 'number') MAX_INLINE_COL_LEN = options.maxInlineColLen;
-	if (typeof options.inListBreakAt   === 'number') IN_LIST_BREAK_AT   = options.inListBreakAt;
+	// Reset to defaults then apply per-call options (prevents mutation bleed between calls)
+	MAX_INLINE_COL_LEN = 80;
+	IN_LIST_BREAK_AT   = 4;
+	REORDER_JOIN_ON    = false;
+	if (typeof options.maxInlineColLen === 'number')  MAX_INLINE_COL_LEN = options.maxInlineColLen;
+	if (typeof options.inListBreakAt   === 'number')  IN_LIST_BREAK_AT   = options.inListBreakAt;
+	if (typeof options.reorderJoinOn   === 'boolean') REORDER_JOIN_ON    = options.reorderJoinOn;
 
 	try {
 		const tokens = tokenize(sql);

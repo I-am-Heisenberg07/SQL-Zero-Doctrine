@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(powershell -Command \"\\(Get-Content 'd:\\\\My Documents\\\\SQL-Zero-Doctrine\\\\formatter.js' -Raw\\) -replace '\\\\bT\\\\b', 'INDENT' | Set-Content 'd:\\\\My Documents\\\\SQL-Zero-Doctrine\\\\formatter.js' -Encoding utf8\")"
-    ]
-  }
-}

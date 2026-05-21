@@ -14,13 +14,6 @@
   },
   "categories": ["Formatters"],
   "keywords": ["sql", "formatter", "zero doctrine", "stored procedure"],
-  "activationEvents": [
-    "onLanguage:sql",
-    "onLanguage:SQL",
-    "onLanguage:tsql",
-    "onLanguage:mssql",
-    "onLanguage:sql-ms"
-  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
@@ -60,7 +53,34 @@
         "key": "ctrl+shift+alt+g",
         "when": "editorTextFocus && editorHasSelection && resourceExtension == sql"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "SQL Zero Doctrine",
+      "properties": {
+        "sqlZeroDoctrine.inListBreakAt": {
+          "type": "number",
+          "default": 4,
+          "description": "Number of items in an IN(...) list before it breaks to multiple lines. Default: 4"
+        },
+        "sqlZeroDoctrine.maxInlineColLen": {
+          "type": "number",
+          "default": 80,
+          "description": "Column character length threshold before switching to long-column treatment. Default: 80"
+        },
+        "sqlZeroDoctrine.reorderJoinOn": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, rewrites ON conditions so the joined table appears on the left side. Default: false"
+        }
+      }
+    }
   },
-  "dependencies": {}
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/I-Am-Walter-White/SQL-Zero-Doctrine.git"
+  },
+  "scripts": {
+    "test": "node formatter.test.js",
+    "package": "npx @vscode/vsce package"
+  }  
 }

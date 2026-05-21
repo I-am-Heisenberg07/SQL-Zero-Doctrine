@@ -4,3 +4,7 @@ node_modules/**
 .git/**
 *.vsix
 package-lock.json
+formatter.test.js
+*.test.js
+node_modules/
+.vscode-test/
