@@ -568,7 +568,7 @@ const TOP_CLAUSE_KWS = new Set([
 	'CREATE','ALTER','DROP',
 	'DECLARE','SET','IF','WHILE',
 	'RETURN','EXEC','EXECUTE','PRINT','RAISERROR','THROW',
-	'INTO',
+	'INTO','WITH',
 	// Rob 2: previously fell through to _ passthrough
 	'USE','TRUNCATE','DBCC','GRANT','REVOKE','WAITFOR',
 	'CHECKPOINT','SAVE','CLOSE','DEALLOCATE','OPEN','KILL',
@@ -1319,26 +1319,18 @@ function expandWhereSegs(validSegs) {
 			const innerSegs = splitAtTopKws(inner, new Set(['AND', 'OR'])).filter(s => s.tokens.length > 0);
 
 			if (innerSegs.length === 1) {
-				// Single condition inside parens — unwrap it.
-				// (x = 1) -> x = 1, no unnecessary wrapping.
-				// Exception: keep parens if the condition itself is complex
-				// (IN subquery, EXISTS, NOT IN) — detected by having an LP inside.
+				// Single condition inside parens — safe to unwrap ONLY if it contains
+				// no subquery (subqueries need their own () wrapper for the IN/NOT IN path)
 				const hasSubquery = inner.some((t, i) =>
 					t.t === 'LP' && inner[i+1]?.t === 'KW' && inner[i+1]?.v === 'SELECT');
 				if (!hasSubquery) {
 					out.push({ kw, tokens: inner });
 					continue;
 				}
-			} else if (innerSegs.length > 1) {
-				// Multiple sub-conditions — only expand if they are themselves paren groups
-				// (genuine nested grouping). (@A=1 AND @B=0) stays as one unit.
-				const hasNestedParen = innerSegs.some(s => isFullParenGroup(s.tokens));
-				if (hasNestedParen) {
-					out.push({ kw, tokens: innerSegs[0].tokens });
-					for (let j = 1; j < innerSegs.length; j++) out.push(innerSegs[j]);
-					continue;
-				}
 			}
+			// Multi-condition groups: NEVER unwrap — removing parens from
+			// (A OR B) AND C would change the logical meaning to A OR B AND C.
+			// Keep all multi-condition paren groups intact.
 		}
 		out.push({ kw, tokens: gt });
 	}
@@ -2131,10 +2123,32 @@ function formatInsertClause(clauseTokens) {
 
 	const selectIdx = clauseTokens.findIndex(t => t.t === 'KW' && t.v === 'SELECT');
 	if (selectIdx >= 0) {
-		const intoToks = clauseTokens.slice(0, selectIdx);
+		const intoToks = clauseTokens.slice(0, selectIdx).filter(t => !(t.t === 'KW' && t.v === 'INTO'));
 		const selectToks = clauseTokens.slice(selectIdx);
 		const lines = [];
-		lines.push('INSERT INTO ' + tokStr(intoToks.filter(t => !(t.t === 'KW' && t.v === 'INTO'))));
+
+		// Extract optional column list (INSERT INTO table (col1, col2, ...) SELECT ...)
+		const colListStart = intoToks.findIndex(t => t.t === 'LP');
+		let tableStr;
+		if (colListStart >= 0) {
+			const tableToks = intoToks.slice(0, colListStart);
+			tableStr = tokStr(tableToks).trim();
+			if (!tableStr.includes('.') && !/^[@#]/.test(tableStr)) tableStr = 'dbo.' + tableStr;
+			const colListEnd = findMatchingParen(intoToks, colListStart);
+			const colToks = intoToks.slice(colListStart + 1, colListEnd);
+			const cols = splitAtCommas(colToks);
+			lines.push('INSERT INTO ' + tableStr);
+			lines.push('(');
+			cols.forEach((ct, i) => {
+				lines.push(INDENT + (i === 0 ? '  ' : ', ') + tokStr(ct).trim());
+			});
+			lines.push(')');
+		} else {
+			tableStr = tokStr(intoToks).trim();
+			if (!tableStr.includes('.') && !/^[@#]/.test(tableStr)) tableStr = 'dbo.' + tableStr;
+			lines.push('INSERT INTO ' + tableStr);
+		}
+
 		const selectFmt = formatSelectStatement(selectToks, true);
 		selectFmt.split('\n').forEach(l => lines.push(l));
 		return lines;
@@ -2477,6 +2491,10 @@ function formatClause(clause) {
 		case 'INTO':     return formatIntoClause(clause.tokens);
 		case 'CREATE':   return formatCreateClause(clause.tokens);
 		// Rob 2: clean passthrough for valid statements without dedicated formatters
+		case 'WITH':
+			// CTE inside proc body — route through formatCTE (same as batch level)
+			// formatCTE already prepends ;WITH
+			return formatCTE(clause.tokens);
 		case 'USE': case 'TRUNCATE': case 'DBCC':
 		case 'GRANT': case 'REVOKE': case 'WAITFOR':
 		case 'CHECKPOINT': case 'SAVE': case 'CLOSE':
