@@ -15,60 +15,66 @@
   "categories": ["Formatters"],
   "keywords": ["sql", "formatter", "zero doctrine", "stored procedure"],
   "activationEvents": [
-      "onLanguage:sql",
-      "onLanguage:tsql",
-      "onLanguage:mssql",
-      "onLanguage:sql-ms"
+    "onLanguage:sql",
+    "onLanguage:tsql",
+    "onLanguage:mssql",
+    "onLanguage:sql-ms"
   ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
       {
         "command": "sqlZeroDoctrine.formatFile",
-        "title": "Format Document",
-        "category": "SQL Zero Doctrine"
+        "title": "Format Document (Zero Doctrine)",
+        "category": "SQL Zero Doctrine",
+        "icon": "$(database)"
       },
       {
         "command": "sqlZeroDoctrine.formatSelection",
-        "title": "Format Selection",
+        "title": "Format Selection (Zero Doctrine)",
         "category": "SQL Zero Doctrine"
       },
       {
-      "command": "sqlZeroDoctrine.reportFeedback",
-      "title": "Report Bug / Request Feature",
-      "category": "SQL Zero Doctrine",
-      "icon": "$(feedback)"
-      }      
+        "command": "sqlZeroDoctrine.reportFeedback",
+        "title": "Report Bug / Request Feature",
+        "category": "SQL Zero Doctrine",
+        "icon": "$(feedback)"
+      }
     ],
     "menus": {
       "editor/context": [
         {
           "command": "sqlZeroDoctrine.formatFile",
-          "when": "resourceExtension == sql || resourceExtension == SQL",
-          "group": "1_modification"
+          "when": "resourceExtension == sql || resourceExtension == SQL || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms",
+          "group": "1_modification@1"
         },
         {
           "command": "sqlZeroDoctrine.formatSelection",
-          "when": "(resourceExtension == sql || resourceExtension == SQL) && editorHasSelection",
-          "group": "1_modification"
+          "when": "(resourceExtension == sql || resourceExtension == SQL || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms) && editorHasSelection",
+          "group": "1_modification@2"
         },
         {
-        "command": "sqlZeroDoctrine.reportFeedback",
-        "key": "ctrl+shift+alt+r",
-        "when": "editorTextFocus && resourceExtension == sql"
-        }        
+          "command": "sqlZeroDoctrine.reportFeedback",
+          "when": "resourceExtension == sql || resourceExtension == SQL || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms",
+          "group": "1_modification@3"
+        }
       ]
     },
     "keybindings": [
       {
         "command": "sqlZeroDoctrine.formatFile",
         "key": "ctrl+shift+alt+f",
-        "when": "editorTextFocus && resourceExtension == sql"
+        "when": "editorTextFocus && (resourceExtension == sql || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms)"
       },
       {
         "command": "sqlZeroDoctrine.formatSelection",
         "key": "ctrl+shift+alt+g",
-        "when": "editorTextFocus && editorHasSelection && resourceExtension == sql"
+        "when": "editorTextFocus && editorHasSelection && (resourceExtension == sql || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms)"
+      },
+      {
+        "command": "sqlZeroDoctrine.reportFeedback",
+        "key": "ctrl+shift+alt+r",
+        "when": "editorTextFocus && (resourceExtension == sql || editorLangId == sql || editorLangId == tsql || editorLangId == mssql || editorLangId == sql-ms)"
       }
     ],
     "configuration": {
@@ -90,15 +96,15 @@
           "description": "When true, rewrites ON conditions so the joined table appears on the left side. Default: false"
         },
         "sqlZeroDoctrine.userName": {
-            "type": "string",
-            "default": "",
-            "description": "Harsh Sugandhi"
+          "type": "string",
+          "default": "",
+          "description": "Your name — added to the modification header when formatting. Leave blank to skip the header."
         },
         "sqlZeroDoctrine.stripCommentedCode": {
-            "type": "boolean",
-            "default": false,
-            "description": "When true, removes lines that are clearly commented-out SQL code (SELECT, FROM, WHERE, JOIN, etc.). Descriptive comments, change notes and section labels are always preserved."
-        }                
+          "type": "boolean",
+          "default": false,
+          "description": "When true, removes lines that are clearly commented-out SQL code (SELECT, FROM, WHERE, JOIN, etc.). Descriptive comments, change notes and section labels are always preserved."
+        }
       }
     }
   },
@@ -109,5 +115,5 @@
   "scripts": {
     "test": "node formatter.test.js",
     "package": "npx @vscode/vsce package"
-  }  
+  }
 }

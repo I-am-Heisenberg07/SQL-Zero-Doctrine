@@ -2660,7 +2660,7 @@ function _isPreamble(line) {
 
 function _isBorder(line)     { return /^\s*--\*{3,}/.test(line); }
 function _isComment(line)    { return /^\s*--/.test(line); }
-function _isModifiedBy(line) { return /^\s*--\s*Modified by:/i.test(line); }
+function _isModifiedBy(line) { return /^\s*--\s*Modified by/i.test(line); }
 
 // Parse a comment line into { key, value } or { raw } if no colon
 function _parseCommentLine(line) {
